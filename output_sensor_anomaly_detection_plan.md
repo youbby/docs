@@ -119,7 +119,7 @@ Step 4~5가 기존 안 대비 추가된 부분입니다. 세그멘테이션 없�
    - Summary, Top Critical Issues, Detail Table
    - **판정 비대상 섹션**: `stage=NOT_APPLICABLE`(고정값 매트릭스, §4.1-A.3) 건은 NG 통계·Top Critical Issues에 섞지 않고 별도 섹션으로 노출한다 — `final_class`(`MATRIX_CONST_TO_VARIABLE` 등)와 `description` 근거를 함께 표시해 엔지니어가 놓치지 않게 한다.
    - **트레이스 차트 (신규, 잠정)**: NG(진성-조치필요/조치불필요) 및 `PENDING_REVIEW` 건에 한해 `matplotlib`로 정적 PNG를 생성해 `data/output/charts/{eval_date}_{unique_key_id}.png`에 저장하고, Detail Table에서 상대경로로 링크한다. `OK`와 `NOT_APPLICABLE`(tsum 자체를 조회하지 않음, §2.4)은 그릴 데이터가 없거나 볼 필요가 없어 생성하지 않는다.
-     - 표시 내용: raw tsum 트레이스, `lsl`/`usl`/`target`(있으면) 수평선, 세그먼트 경계 수직선(`segmentation_applied=True`일 때) + worst 세그먼트 강조, 이상점(`OUTLIER_MAD_K` 기준으로 걸러진 점) 마커, `ref_avg ± ref_std` 대역 — `description`(§4.4-B)의 문구를 시각적으로 대응 확인할 수 있게 한다.
+     - 표시 내용: raw tsum 트레이스, `lsl`/`usl`/`target`(있으면) 계단선(step), 세그먼트 경계 수직선(`segmentation_applied=True`일 때) + worst 세그먼트 강조, 이상점(`OUTLIER_MAD_K` 기준으로 걸러진 점) 마커, `ref_avg ± ref_std` 대역 — `description`(§4.4-B)의 문구를 시각적으로 대응 확인할 수 있게 한다. **`lsl`/`usl`/`target`은 하루 중에도 값이 바뀔 수 있어(사용자 확인) 고정 수평선이 아니라 tsum 각 행의 실제 값을 그대로 따라가는 계단선으로 그린다** — 이전엔 `.iloc[0]`(첫 행) 값 하나로 수평선을 그려서 중간에 규격이 바뀌어도 반영이 안 됐다.
      - 정적 PNG로 시작하는 이유: 로컬/수동 구동 원칙(§1.2, 서버 없음)과 맞고 인터랙티브 HTML보다 의존성이 가볍다. **일단 이대로 시도해보고 부족하면 다시 조정한다.**
 
 ### 2.4 데이터 조회 방식 (SQream 접속)
@@ -194,8 +194,8 @@ for (spec_nick, no_spec_nick), group in ng_tttm.groupby(nickname_pairs):
 
 **여러 `unique_key_id`가 같은 tsum 데이터를 공유하는 경우 (그룹핑 정책)**: §2.1에서 밝혔듯 `part`/`area`/`grade`/`recipe`만 다른 `unique_key_id`들은 tsum 조회 키(`chmbr_name`+`sensor_name`+`meas_type_id`)가 같아 물리적으로 동일한 tsum 원본 데이터를 공유한다. 이때 "그룹당 1회 계산 후 결과를 그룹 내 모든 `unique_key_id`에 그대로 복사"하는 방식은 **쓰지 않는다** — `ref_avg`/`ref_std`(그리고 `ref_cpk`/`ref_cpk*`/`ref_cpm`)는 각 `unique_key_id`마다 tttm에서 따로 산출되는 값이라, 같은 tsum을 봐도 `unique_key_id`별로 평소 기준(baseline)이 다를 수 있다 — 최종 `final_class`까지 그대로 복사하면 그 차이를 무시하게 되어 오판정으로 이어진다. 대신 계산을 두 단계로 나눠 캐시 범위를 명확히 한다.
 
-- **그룹당 1회만 계산 (캐시/공유)**: tsum 조회, §4.2-0 기준정보 무결성 체크, §4.2 세그멘테이션(경계 위치), §4.3의 tsum 원시 통계(세그먼트별 `avg`/`std`, `lsl_violations`/`usl_violations`/`max_out_magnitude`, `spike_count`, `step_change_flag`, `data_drift_slope`, `skewness`/`kurtosis`) — 이 값들은 tsum 데이터 자체에서만 나오므로 그룹의 어떤 `unique_key_id`를 계산하든 결과가 동일하다.
-- **`unique_key_id`별로 각자 계산**: `cp`/`cpk`/`cpm`(각자의 `lsl`/`usl`/`target`과 그룹 공유 `avg`/`std`로 계산 — `lsl`/`usl`/`target`은 tsum 컬럼이라 그룹 내에서도 값이 같을 수 있지만, `ref_cpk`/`ref_cpk*`/`ref_cpm`은 각자의 tttm 이력에서 나오므로 다를 수 있다), §4.4-0/A의 최종 Rule 판정(`final_class`), §4.4-B의 `description`, `confidence`. 즉 tsum을 다시 조회하거나 세그멘테이션을 다시 돌리지는 않지만, "OK냐 NG냐"는 반드시 `unique_key_id`마다 따로 확정한다.
+- **그룹당 1회만 계산 (캐시/공유)**: tsum 조회, §4.2-0 기준정보 무결성 체크, §4.2 세그멘테이션(경계 위치), §4.3의 세그먼트별 원시 통계를 **각 세그먼트 자신의 규격 기준으로** 계산한 1차 값(`avg`/`std`/`spike_count`/`step_change_flag`/`data_drift_slope`/`skewness`/`kurtosis`와, 세그먼트 자신의 규격 기준 `cp`/`cpk`/`cpm`/`lsl_violations`/`usl_violations`/`max_out_magnitude`) — 이 1차 값들은 tsum 데이터 자체에서만 나오므로 그룹의 어떤 `unique_key_id`를 계산하든 결과가 동일하다.
+- **`unique_key_id`별로 각자 계산**: 어느 세그먼트가 worst인지(1차 임시 판정은 그룹 공유 값으로 하지만, `ref_avg`/`ref_std`가 키마다 달라 그 결과인 worst 판정 자체는 키마다 달라질 수 있다), worst 세그먼트의 **정상 세그먼트 규격 기준 재계산 `cp`/`cpk`/`cpm`/규격위반**(위 §4.4-0 참고, 그룹 공유 1차 값과 다를 수 있음), `ref_cpk`/`ref_cpk*`/`ref_cpm`(각자의 tttm 이력에서 나오므로 다를 수 있음), §4.4-0/A의 최종 Rule 판정(`final_class`), §4.4-B의 `description`, `confidence`. 즉 tsum을 다시 조회하거나 세그멘테이션을 다시 돌리지는 않지만, "OK냐 NG냐"와 그 근거가 된 Cpk 수치는 반드시 `unique_key_id`마다 따로 확정한다.
 
 이 그룹핑은 §5.3 Tab 2에서 사용자가 체크박스로 어떤 `unique_key_id`를 골랐는지와 무관하게 내부적으로 적용된다 — 그룹 내 하나라도 선택되면 그 그룹의 tsum 조회·세그멘테이션은 1회만 수행되고, 그룹 내 다른 선택된 `unique_key_id`들은 이미 구해둔 원시 통계를 재사용해 자신의 Rule 판정만 계산한다.
 
@@ -286,7 +286,7 @@ avg 이탈과 std 이탈을 따로 계산해서 나중에 합치지 않고, **�
 - 적분 구간은 원래 검토안(`ref_avg ± 3*ref_std`인 유한 구간)이 아니라 **전 구간(−∞~∞)으로 확정**했다 — 실측상 3σ 이내에서는 두 방식의 값 차이가 2% 미만이고, 3σ를 넘어가는 영역은 가중치 `w(x)` 자체가 이미 지수적으로 감쇠시켜 결과가 미미해지므로, 굳이 유한 구간으로 잘라 erf 계산을 추가할 이유가 없다. 전 구간을 쓰면 평균/표준편차만으로 바로 계산되는 closed-form이 된다.
 - `ref_avg`/`ref_std`가 **매번 최근 7일 윈도우로 다시 계산**되기 때문에(§4.1-0), 창이 하루씩 밀리면서 최근 추세가 자연스럽게 reference에 반영된다 — 예전에 `z_ewma`가 하던 일을 reference 구성 자체가 대신한다.
 - 급격한 스파이크에 대한 강건성(예전 `z_robust`의 역할)은 7일치를 평균 내는 pooling 자체가 어느 정도 대신한다 — 하루짜리 튐이 있어도 7개 중 하나로 희석된다. 이 정도로 충분한지, 그리고 7이라는 개수 자체가 적절한지는 Phase 1 백테스트에서 검증 필요(§4.1-0 참고).
-- `THETA_OVERLAP`: **W-RIC 자체의 NG 판정 기준선**이다 — 그 키의 과거 W-RIC 분포에서 `CALIBRATION_PERCENTILE`(§3)에 해당하는 지점을 기본값으로 자동 산출하고, 도메인 지식이 있는 경우에만 수동 override. (예전에는 `-ln(W-RIC)`을 나누는 정규화 분모였으나, `anomaly_score`를 W-RIC 그대로 쓰는 것으로 전환하면서 역할이 "나누는 값"에서 "직접 비교하는 컷"으로 바뀌었다. 그에 따라 별도 전역 컷이었던 `ANOMALY_SCORE_THRESHOLD`는 폐기 — `THETA_OVERLAP` 하나로 통합됐다.)
+- `THETA_OVERLAP`: **W-RIC 자체의 NG 판정 기준선**이다 — 그 키의 과거 W-RIC 분포에서 `CALIBRATION_PERCENTILE`(§3)에 해당하는 지점을 기본값으로 자동 산출하고, 도메인 지식이 있는 경우에만 수동 override. (예전에는 `-ln(W-RIC)`을 나누는 정규화 분모였으나, `anomaly_score`를 W-RIC 그대로 쓰는 것으로 전환하면서 역할이 "나누는 값"에서 "직접 비교하는 컷"으로 바뀌었다. 그에 따라 별도 전역 컷이었던 `ANOMALY_SCORE_THRESHOLD`는 폐기 — `THETA_OVERLAP` 하나로 통합됐다.) **키별 자동 보정(`CALIBRATION_PERCENTILE`)이 아직 미정이라, PoC GUI는 전역 placeholder(`gui/common.py`의 `THETA_OVERLAP_PLACEHOLDER=0.175`)를 그대로 쓴다.** 이 값은 사용자가 실사용 중 "`comp_std`가 `ref_std`의 8배 이상 벌어지는 산포 폭주 케이스를 놓친다"는 문제를 발견하고 역산해 지정했다 — 중심치가 같을 때 `W-RIC(r) = sqrt(2)/sqrt(1+r^2)`(`r=comp_std/ref_std`)이므로, `r=8`일 때 `W-RIC≈0.175`가 나온다(기존 `0.1`은 `r≈14.1`부터만 잡혀 너무 둔감했음). 다만 이건 전역 고정값이라 모든 키에 균일하게 적용되고, 실제로는 §3에서 설명한 대로 산포가 원래 큰 키/작은 키마다 이 값이 다르게 보정돼야 맞다 — 실측 데이터로 `CALIBRATION_PERCENTILE`을 확정하기 전까지의 임시값이다.
 - **`-ln(W-RIC)`(보조 지표, 필요할 때만 계산)**: `THETA_OVERLAP`이 아주 작아지는 구간(예: 0.1, 0.001 수준)에서는 W-RIC 값들이 0 근처로 눌려서 서로 구분하기 어려워진다. 이 구간에서 여러 NG 건의 심각도를 비교/정렬해야 할 때(예: 리포트의 Top Critical Issues 순위)만 `-ln(W-RIC)`을 보조로 계산해 쓴다. **`is_ng` 판정 자체는 항상 원본 W-RIC 기준이며, `-ln`은 판정에 관여하지 않는다** — 순서(랭킹)는 어느 쪽으로 봐도 동일하지만, `-ln`은 0 근처로 눌린 값들을 펼쳐서 사람이 심각도 차이를 더 잘 구분하게 해준다.
 
 **처리 흐름**
@@ -437,7 +437,15 @@ ref_cpk  = min((usl-ref_avg)/(3*ref_std),  (ref_avg-lsl)/(3*ref_std))   # 타이
 ref_cpk* = min((usl-ref_avg)/(3*ref_std*), (ref_avg-lsl)/(3*ref_std*))  # 관대한 기준 (평소 흔들림까지 감안, ref_cpk* ≤ ref_cpk)
 ```
 
-(`ref_std`/`ref_std*`는 §4.1-0 참고. `lsl`/`usl`은 오늘 tsum 조회 시 함께 받은 값을 그대로 쓴다.)
+(`ref_std`/`ref_std*`는 §4.1-0 참고.)
+
+**`lsl`/`usl`/`target`의 기준 — "정상(=worst가 아닌) 세그먼트"의 규격을 쓴다(사용자 확인, 신규).** tsum의 `lsl`/`usl`/`target`은 하루 중에도 값이 바뀔 수 있어(예: 규격 개정이 그날 있었던 경우), 세그먼트마다 서로 다를 수 있다. `worst_segment_cpk`/`worst_segment_cpm`과 규격 위반 개수(§4.3)는 **worst 세그먼트 자신에게 기록된 규격이 아니라, 정상 세그먼트(worst가 아닌 다른 세그먼트) 쪽 규격을 빌려와서** 계산한다 — worst 세그먼트 자신의 규격을 그대로 쓰면, 값이 변한 바로 그 시점에 규격도 같이(우연히든 의도적으로든) 바뀌어 기록된 경우 실제로는 이탈인데도 "새 규격 안에 잘 들어간다"고 잘못 판단할 위험이 있기 때문이다. `ref_cpk`/`ref_cpk*`/`ref_cpm`도 이 빌려온 규격을 그대로 쓴다.
+
+- 세그먼트가 1개(변경점 없음)면 빌려올 "다른 세그먼트"가 없으므로 그 세그먼트(=그날 전체) 자신의 규격을 그대로 쓴다 — 지금까지와 동일.
+- 세그먼트가 2개일 때 "어느 쪽이 worst인지"부터가 규격 비교 결과(Rule 판정)에 좌우되는 순환 구조라, 2단계로 처리한다(`gui/pipeline.py`의 `_classify_row`):
+  1. **1차(임시)**: 각 세그먼트를 **자기 자신의 규격**으로 임시 Rule 판정해 worst를 가린다.
+  2. **2차(최종)**: worst로 가려진 세그먼트만, **정상(other) 세그먼트의 규격**으로 `cp`/`cpk`/`cpm`/규격위반 피처를 다시 계산하고, 그 규격으로 `ref_cpk`/`ref_cpk*`/`ref_cpm`도 다시 만들어 최종 Rule 판정을 내린다. 1차에서 정한 worst 인덱스는 2차에서 다시 뒤집지 않는다(값 변화가 감지된 세그먼트를 계속 대상으로 삼아야 하므로 — 안 그러면 두 세그먼트가 서로를 worst로 미루는 진동이 생길 수 있다).
+  - 정상 세그먼트에도 규격 자체가 없으면(둘 다 `lsl`/`usl`이 없음) 빌려올 게 없으므로 worst 세그먼트 자신의 규격(있다면)을 그대로 쓴다.
 
 - `worst_segment_cpk ≥ ref_cpk` → 가성/조치불필요 (평소 최상 수준과 같거나 더 좋음)
 - `ref_cpk* ≤ worst_segment_cpk < ref_cpk` → PENDING_REVIEW (애매한 중간)
@@ -585,11 +593,12 @@ Python GUI는 **PySide6**로 만든다 — 탭, 멀티셀렉트 드롭다운, �
   - **DB 조회가 실패하면(접속 미설정/네트워크 등 사유 무관) 데모 데이터로 자동 대체한다** — 실패 사유(예외 타입+메시지)를 화면 상태줄과 로그(§5.4)에 그대로 남긴다.
 - **조회 결과 건수를 화면에 바로 보여준다(신규)**: DB(또는 데모) 조회 직후 "전체 N행 / 당일(`rpt_day=...`) M행, `unique_key_id` K개"를 표시하고, ①~③ 처리가 끝나면 "→ 판정 테이블 R행"을 이어붙인다 — 당일 행이 0건이라 화면에 아무것도 안 뜨는 것인지, 화면 렌더링 쪽 문제인지 바로 구분할 수 있게 하기 위함이다.
 - **산출물 — 데이터셋 A(1차 판정 데이터셋)**: `unique_key_id`별 ref/comp 값과 §2.3 스키마 필드를 그대로 담는다. GUI 세션 메모리에 보관하며, `RULE_NG`(tsum 대기)만 Tab 2로 넘어간다 — `EXCLUDED`/`NOT_APPLICABLE`/`RULE_OK`는 이미 최종 판정이라 Tab 2를 거치지 않는다.
+- **날짜를 바꿔 재조회하면 데이터셋 A/B가 초기화된다(`dataset_a`/`dataset_b`/`tsum_raw` 전부 새로 비움) — 그리고 Tab 2 화면에 남아있던 이전 조회 결과도 같이 지운다(신규, 사용자 요청).** 그 전까지는 [조회]가 끝나도 Tab 2에 이전 날짜의 목록이 그대로 남아 있어(사용자가 [필터 적용]을 다시 눌러야만 새로고침됨), 어느 날짜 결과를 보고 있는지 착각하기 쉬웠다. `gui/tab1.py`의 `Tab1Widget`이 `on_query_complete` 콜백(`MainWindow`가 `tab2.clear_rendered`로 연결)을 [조회] 완료 시 호출해, 필터 선택(LINE/PART/GRADE/STAGE)은 그대로 두고 화면에 그려진 목록·건수·"전체 선택" 체크만 비운다.
 - **화면 표시 컬럼**: 맨 앞에 `rpt_day`(=이 판정의 기준일자 `eval_date`, 신규 — 사용자 요청으로 Tab 1/2/3 공통으로 맨 앞에 추가)를 두고, 이어서 `unique_key_id`를 합성된 문자열 그대로 노출하지 않고 이를 구성하는 9개 컬럼(`line`/`part`/`area`/`eqpid`/`tttm_property`/`param_name`/`tsum_type`/`grade`/`recipe`, §2.1)을 각각 컬럼으로 펼쳐서 보여준다. 그 뒤로 당일 값(`avg`/`std`/`prod_cnt`)과 reference 값(`ref_avg`/`ref_std`), 마지막으로 1차 판정 결과(`stage`/`final_class`/`anomaly_score`)를 순서대로 표시한다. `is_ng`는 `stage`(`RULE_OK`/`RULE_NG`/`EXCLUDED`/`NOT_APPLICABLE`)만 봐도 그대로 읽히는 값이라 화면에는 표시하지 않는다 — 필드 자체는 §2.3 스키마대로 데이터셋 A/DB에 계속 남는다(Tab2에서 `final_class`가 갈려도 `is_ng`는 1차 판정 스냅샷으로 유지).
 
 #### Tab 2. tsum 분석 대상 선택 및 2차 판정
 
-- **상단 메뉴 영역**(Tab 1과 같은 위치에 고정): `LINE` / `PART` / `GRADE` / `STAGE` 4개 필터, 전부 "ALL" 포함 멀티셀렉트 드롭다운.
+- **상단 메뉴 영역**(Tab 1과 같은 위치에 고정): `LINE` / `PART` / `GRADE` / `STAGE` 4개 필터, 전부 "ALL" 포함 멀티셀렉트 드롭다운. **[필터 적용]/[분석]/[저장] 버튼을 전부 이 줄에 모아둔다(신규, 사용자 요청)** — 예전엔 [분석]/[저장]이 표 아래 별도 줄에 있었는데, 버튼을 한 곳(상단)에 몰아 화면을 오갈 필요를 줄였다. 진행 상태(`progress_label`)는 그 아래 필터 결과 건수 옆으로 옮겼다.
   - `LINE`/`PART`/`GRADE` 선택지는 코드에 하드코딩하지 않고 별도 config 파일 `anomaly_agent/config/ui_filters.json`에서 읽는다 — tttm의 실제 컬럼값이라 사이트/환경마다 달라지기 때문이다(형식 예시):
     ```json
     {
@@ -621,7 +630,10 @@ Python GUI는 **PySide6**로 만든다 — 탭, 멀티셀렉트 드롭다운, �
      - 두 차트는 같은 matplotlib figsize(`visualizer.CHART_FIGSIZE`)로 그려서 화면에 같은 크기로 나란히 보인다.
      - **`lsl`/`usl`/`target`(있으면) 참고선(신규)**: tsum 분석이 끝난 항목은 `AppState.tsum_raw`(§5.3 Tab2 [분석]이 그룹당 1회 조회해둔 raw tsum)에서 규격값을 알 수 있어, 두 차트에도 같이 표시한다 — 일간 추이 차트(왼쪽)는 값(y)축 수평선, 분포 오버랩 차트(오른쪽)는 값(x)축 수직선(`visualizer.render_daily_trend_chart`/`render_overlap_chart`의 `lsl`/`usl`/`target` 파라미터, `detail_dialog.py`의 `_spec_from_tsum_raw`). tsum 분석 전이거나 이 세션에서 raw tsum을 조회하지 않았으면(Tab3 등) 규격값을 모르므로 참고선 없이 그려진다.
   4. 구분선 + "**아래는 tsum 분석 진행 후에 추가로 생성되는 데이터입니다**" 라벨.
-  5. `description`(§4.4-B, 판정에 쓰인 실제 수치가 그대로 포함됨)과 트레이스 차트(§2.3 PNG, `chart_path`) — 분석 전이면 각각 `"tsum 분석 미진행"`과 "(차트 없음)"으로 비어 있는 상태 그대로 표시된다. 트레이스 차트 옆에는 **"tsum raw 데이터 보기" 버튼(신규)**이 있어, 누르면 그 차트를 그린 원본 tsum 행 전체를 표(팝업의 팝업)로 볼 수 있다 — Tab2 [분석]이 그룹당 1회 조회해둔 raw tsum(`AppState.tsum_raw`)을 재사용하므로 다시 조회하지 않는다. Tab1에서 조회한 데이터가 없을 때(Tab3 등)와 마찬가지로, raw tsum이 없으면 버튼이 비활성화된다.
+  5. `description`(§4.4-B, 판정에 쓰인 실제 수치가 그대로 포함됨)과 트레이스 차트(§2.3 PNG, `chart_path`) — 분석 전이면 각각 `"tsum 분석 미진행"`과 "(차트 없음)"으로 비어 있는 상태 그대로 표시된다. 트레이스 차트 옆에는 **"tsum raw 데이터 보기"**와 **"라이브 차트 보기"(신규)** 버튼이 있다.
+     - **"tsum raw 데이터 보기"**: 누르면 그 차트를 그린 원본 tsum 행 전체를 표(팝업의 팝업)로 볼 수 있다 — Tab2 [분석]이 그룹당 1회 조회해둔 raw tsum(`AppState.tsum_raw`)을 재사용하므로 다시 조회하지 않는다.
+     - **"라이브 차트 보기"(신규)**: `AppState.tsum_raw`가 세션 동안 이미 메모리에 있으므로 추가 조회 없이, matplotlib을 Qt 위젯(`FigureCanvasQTAgg`)으로 직접 임베드한 인터랙티브 차트를 별도 팝업으로 띄운다 — `NavigationToolbar2QT`로 확대/축소/이동이 되고 좌표를 마우스로 호버해 정확한 값을 볼 수 있다. 그려지는 내용(세그먼트 강조/이상점 마커/`lsl`/`usl`/`target`/`ref_avg±ref_std`)은 정적 PNG와 기본적으로 같은 정보를 담지만, `draw_trace_chart(..., show_markers=True)`로 **선을 더 가늘게 하고 실측 지점마다 점(타점)을 찍는다(신규, 사용자 요청, 라이브 차트 전용)** — 선만 그리면 "원래 고정값이라 평평한 것"과 "데이터가 띄엄띄엄 보고돼서 평평해 보이는 것"을 구분할 수 없어서다. 정적 PNG(`render_trace_chart`)는 타점 없이 기존 그대로 유지한다(둘 다 `visualizer.py`의 `draw_trace_chart(ax, ...)`를 공유하되 `show_markers` 플래그만 다르게 호출). 세그먼트 강조에 필요한 `change_point_index`/`worst_segment_index`는 `DatasetARow`의 신규 세션 전용 필드로 `_classify_row`가 채운다(다른 정보 패널 필드들과 같은 패턴, DB에는 저장 안 됨).
+     - 둘 다 raw tsum이 없으면(분석 전이거나 이 세션에서 조회하지 않았으면) 버튼이 비활성화된다. 정적 PNG는 `chart_path`로 DB/Tab3에 남는 "기록"이고, 라이브 차트는 이 세션 중 탐색용으로만 쓰이며 저장되지 않는다.
      - **트레이스 차트 왼쪽에 수치 정보 패널(신규)**: 차트가 800px 고정폭이라 1300px 팝업을 다 못 채워 남는 왼쪽 공간에, `description` 문장을 다시 읽지 않아도 되도록 분석 수치를 그대로 나열한다 — 데이터 개수(`n_points`)/세그먼트 개수, `ref`(`ref_avg`±`ref_std`) / `comp`(당일 `avg`±`std`), `ref_cpk`/`ref_cpk*`/`ref_cpm`, worst 세그먼트 `cpk`/`cpm`, 기울기(`data_drift_slope`)/하루 총 변화량(`drift_total_change`), 스파이크 횟수, `skewness`/`kurtosis`(`detail_dialog.py`의 `_format_feature_summary`). 이 값들은 `DatasetARow`에 담기지만 `result_store.py`의 `SCHEMA_COLUMNS`에는 없어 **DB에는 저장되지 않는다** — `AppState.tttm_window`/`tsum_raw`와 같은 "Tab2 [분석]을 거친 세션에서만 채워지는" 패턴이라, Tab3에서 과거 저장 결과를 다시 열면 이 패널은 빈 상태 안내만 표시된다.
   - `final_class=PENDING_REVIEW`인 경우에 한해 팝업에서 판정을 직접 수정할 수 있다 — 이게 §6에서 미정으로 남겨뒀던 "엔지니어 라벨링 수단"의 구체적 형태다. 수정 결과는 `engineer_label`(§7 ML용으로도 재사용)에 반영되고, 수정 시각을 `modified_at`(신규 필드, §2.3)에 기록한다. `OK`/`NG`로 이미 Rule이 확정한 건은 이 팝업에서 수정 대상이 아니다(V1 범위).
 - **산출물 — 데이터셋 B(2차 판정 데이터셋)**: 데이터셋 A의 `RULE_NG` 서브셋에 세그먼트/피처/최종 `final_class`/`description`/(수정됐다면 `modified_at`)가 채워진 것. 마찬가지로 GUI 세션 메모리에 보관한다.
