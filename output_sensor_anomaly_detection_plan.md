@@ -93,7 +93,9 @@ Step 4~5가 기존 안 대비 추가된 부분입니다. 세그멘테이션 없�
 
 1. **결과 Raw 데이터 (`tb_anomaly_detection_raw`)**
 
-   **저장 형식: SQLite** (`anomaly_agent/data/output/results.db`, 테이블명 `tb_anomaly_detection_raw`). CSV가 아니라 SQLite인 이유: ① `PENDING_REVIEW` 건을 나중에 GUI에서 수정하면(§5.3) 기존 행을 갱신해야 하는데 CSV는 특정 행만 갱신하기 어렵고 SQLite는 `UPDATE` 한 번이면 된다. ② §5.3 Tab 3(결과 조회)이 날짜·키·판정으로 필터 조회를 해야 하는데 SQL이 자연스럽다. Primary key는 `(eval_date, unique_key_id)`이고 저장은 **UPSERT**(있으면 갱신, 없으면 삽입)로 한다 — `RULE_NG`인데 아직 tsum 분석 전인 상태로 먼저 저장해둬도, 나중에 분석이 끝나거나 사람이 `PENDING_REVIEW`를 수정했을 때 같은 키로 다시 UPSERT하면 되므로 저장 시점을 여러 번 나눠 눌러도 안전하다.
+   **저장 형식: SQLite** (`anomaly_agent/data/output/results.db`, 테이블명 `tb_anomaly_detection_raw`). CSV가 아니라 SQLite인 이유: ① `PENDING_REVIEW` 건을 나중에 GUI에서 수정하면(§5.3) 기존 행을 갱신해야 하는데 CSV는 특정 행만 갱신하기 어렵고 SQLite는 `UPDATE` 한 번이면 된다. ② §5.3 Tab 3(결과 조회)이 날짜·키·판정으로 필터 조회를 해야 하는데 SQL이 자연스럽다. Primary key는 `(eval_date, unique_key_id)`이고, Tab 3의 단건 수정(HITL)은 **UPSERT**(있으면 갱신, 없으면 삽입)로, Tab 2 [저장](데이터셋 A 전체 재저장)은 그 `eval_date`를 통째로 지우고 다시 채우는 **delete-then-replace**로 한다(§5.3 최종 저장 참고).
+
+   같은 `results.db` 파일 안에 **ML 도입 사전 준비용 별도 테이블 `tb_tsum_ml_features`**(신규, §7.2)도 함께 저장된다 — tsum raw 트레이스의 분포/다봉성/주기성/추세/이산성/변경점 feature를 Tab2 [분석] 시점에 미리 뽑아 축적해두는 테이블로, Rule 판정과는 관심사가 달라 메인 테이블과 스키마를 분리했다.
 
    | 필드 | 타입 | 비고 |
    |---|---|---|
@@ -344,7 +346,7 @@ flowchart TD
 
 1차 NG로 선별된 `(unique_key_id, eval_date)`에 대해 `tsum`을 조회한다.
 
-#### 0. tsum 기준정보 무결성 체크 (신규)
+#### 0. tsum 기준정보 무결성 체크
 
 세그멘테이션에 들어가기 전에, 오늘 조회된 tsum 데이터를 tsum 자체 키(`chmbr_name`+`sensor_name`+`meas_type_id`, §2.1)로 묶었을 때 `start_step`/`end_step` 조합이 **2개 이상 존재하는지**만 확인한다. 센서 하나(키 하나)에는 보통 스텝 구간 정보가 하나만 붙어 있어야 하므로, 복수로 존재한다는 것은 이 데이터가 여러 스텝 구간의 값이 뒤섞여 조회됐다는(또는 tsum 기준정보 자체가 잘못됐다는) 신호로 본다. `start_step`/`end_step`은 이 무결성 확인 외의 용도(예: 세그멘테이션 식별자)로는 쓰지 않는다 — 세그멘테이션은 여전히 아래 변경점 탐지 단독 방식이다(§2.1 참고).
 
@@ -353,33 +355,43 @@ flowchart TD
 
 실제로 이 케이스가 얼마나 발생하는지는 Phase 1 백테스트로 확인이 필요하다(§6).
 
-#### 1. 알고리즘: 단일 변경점 탐지 (coarse-to-fine)
+#### 1. 알고리즘: 단일 변경점 탐지 (ruptures 기반, §4.2-1 개정 — 사용자 요청)
 
-추가 식별자가 없으므로(§2.1 참고) `recipe_step_id` 기반이 아니라 **변경점 탐지(binary segmentation)** 하나로 구간을 나눈다. 목표는 "정확히 언제 바뀌었는지"가 아니라 **"오늘 하루 안에 조건이 바뀐 지점이 있는가"라는 사실 자체**이므로, 변경점은 최대 1개(세그먼트 최대 2개)만 찾는다 — 여러 개를 재귀적으로 찾는 로직은 만들지 않는다.
+추가 식별자가 없으므로(§2.1 참고) `recipe_step_id` 기반이 아니라 **변경점 탐지(change point detection)** 하나로 구간을 나눈다. 목표는 "정확히 언제 바뀌었는지"가 아니라 **"오늘 하루 안에 조건이 바뀐 지점이 있는가"라는 사실 자체**이므로, 변경점은 최대 1개(세그먼트 최대 2개)만 찾는다 — 여러 개를 재귀적으로 찾는 로직은 만들지 않는다(사용자 확인 — 이번 개정에서도 그대로 유지).
 
-**이상점 사전 제거 (강건화)**: 안정적인 구간에 값 1~2개만 튀어도, naive 평균/표준편차가 그 이상치에 끌려가면서 엉뚱한 지점이 변경점으로 잘못 검출될 수 있다. 이를 막기 위해 `diff_score` 계산에 쓰이는 `before`/`after`의 평균·표준편차는 **이상점을 제외하고** 낸다.
+**개정 배경 — 구 방식(coarse-to-fine + W-RIC)의 한계.** 원래는 시간 단위(1시간) 경계로 coarse 탐색 후 그 주변을 fine 탐색하며, 각 후보 분할점의 `diff_score(t) = -ln(W-RIC(before_clean, after_clean))`로 랭킹하고, 최종 승인은 `W-RIC < SEGMENT_CHANGE_THRESHOLD(0.1)`로 판단했다. 이 방식은 **완만하게(서서히) 변화하는 drift를 못 잡는 문제**가 있었다(사용자 리포트) — 전이구간이 있는 데이터는 어느 지점에서 잘라도 `before`/`after` 양쪽에 전이구간의 값이 일부 섞여 분포가 실제로는 덜 갈라지기 때문이다. 실측: 하루 총 변화량 약 7(σ≈2) 수준의 완만한 drift에서 어떤 분할점을 골라도 W-RIC이 0.14~0.50으로, 임계값 0.1을 넘지 못해 변경점이 전혀 검출되지 않았다. 반면 똑같은 크기의 **즉시 계단 변화**(전이구간 없음)는 W-RIC 0.037로 정확히 검출됨을 확인 — 즉 알고리즘 자체가 아니라 "완만한 전이"라는 데이터의 성격이 기존 시간-분할 탐색의 구조적 사각지대였다.
 
-- **탐지 기준**: `|x - median| > OUTLIER_MAD_K * scale` (median/MAD는 이상치 자체에 거의 안 흔들리는 강건 통계라 사용한다). 단순 3-sigma(mean/std 기반)를 쓰지 않는 이유는, mean/std 자체가 이미 이상치 때문에 부풀어 있어서 "이상치가 자기 자신을 숨기는" 순환 논리에 빠지기 때문이다.
-  - **`scale`은 기본적으로 MAD, 단 MAD가 정확히 0이면 std로 대체한다(사용자 리포트로 수정).** 산포가 작은 센서는 다수의 포인트가 정확히 같은 값(양자화/분해능 한계 등)이라 MAD가 0이 되기 쉬운데, 이러면 `OUTLIER_MAD_K`를 아무리 올려도(`k*0=0`) median과 조금이라도 다른 모든 정상 변동까지 전부 스파이크로 잡혀버린다 — 산포가 작은 값에서 단발 스파이크가 과다검출되던 실제 원인이었다(`OUTLIER_MAD_K`를 올리는 것만으로는 근본적으로 해결이 안 됨). MAD가 0이 아니면(진짜 스파이크가 섞여 있어도) 그대로 MAD를 쓴다 — std로 바꾸면 스파이크 자체가 std를 부풀려 스스로를 숨기는 문제가 재발하므로, MAD=0인 완전히 퇴화된 경우에만 예외적으로 대체한다(`segmenter.py`의 `mad_outlier_mask`).
-- **적용 범위**: 이 제외는 `diff_score` 계산(coarse/fine 탐색 모두)에만 적용된다. 이상점 자체를 데이터에서 삭제하는 것이 아니라서, `MIN_SEGMENT_COUNT`(구간 내 데이터 개수 판정)는 이상점을 포함한 전체 개수로 그대로 센다.
+**새 방식 — 탐색(WHERE)과 승인(IS IT REAL)을 분리한 2단계 설계.**
 
-**차이 지표**: 후보 분할점 `t`에 대해 `before`(t 이전, 이상점 제외)를 `ref`, `after`(t 이후, 이상점 제외)를 `comp`로 놓고 §4.1-B와 동일한 W-RIC 공식으로 거리를 잰다.
+1. **탐색**: [`ruptures`](https://github.com/deepcharles/ruptures) 라이브러리의 `Binseg(model="l2", min_size=MIN_SEGMENT_COUNT)`로 분할점을 찾는다(`predict(n_bkps=1)`로 정확히 1개). 시간 기준 coarse-to-fine 대신 값 자체를 대상으로 한 번에 탐색하므로 `times`는 더 이상 필요 없다. `min_size`가 `MIN_SEGMENT_COUNT`(§3)를 그대로 이어받아 양쪽 구간이 너무 작아지는 걸 막는다.
+2. **승인**: 그 분할점 앞/뒤(이상점 제외, 아래 참고)의 **`separation_ratio`**(1차원 Otsu식 분리도 — 집단간분산/전체분산, 0~1)를 계산해 `CHANGE_POINT_SEPARATION_THRESHOLD`(신규, 0.3) **이상**이면 변경점으로 확정한다.
 
 ```
-diff_score(t) = -ln( W-RIC(ref_avg=mean(before_t_clean), ref_std=std(before_t_clean),
-                            comp_avg=mean(after_t_clean),  comp_std=std(after_t_clean)) )
+separation_ratio(idx) = between_variance(before_clean, after_clean) / total_variance(before_clean ∪ after_clean)
+between_variance = (n1·n2 / (n1+n2)²) · (mean(before_clean) - mean(after_clean))²
 ```
 
-평균 차이만 보지 않고 이 지표를 쓰는 이유는 §4.1-B와 같다 — 중심 이동과 산포 변화를 동시에 잡아내기 위함이다 (평균만 비교하면 산포만 바뀌는 변경점을 놓친다).
+평균 차이를 표본 크기로 가중해 두 구간 분포의 분리 정도를 직접 재는 지표라, 전이구간이 있어도(그래서 양쪽 평균 차이가 어느 지점에서든 비교적 크게 유지되는 한) 감도가 높다 — W-RIC처럼 "겹침 비율"을 재는 것과는 다른 접근이다.
 
-**탐색 절차 (coarse → fine)**:
-1. 하루 전체 데이터 개수가 `MIN_SEGMENT_COUNT`의 2배에도 못 미치면, 애초에 유효한 분할 후보가 없으므로 바로 "변경점 없음"으로 처리한다.
-2. **Coarse**: 시간 단위(예: 1시간)로 경계를 나눠 각 경계를 후보 분할점으로 놓고 `diff_score`를 계산, 가장 큰 값을 보이는 시간 경계를 찾는다.
-3. **Fine**: 그 경계 주변(앞뒤 각 1시간 정도)에서 개별 데이터 포인트 단위로 `diff_score`를 다시 계산해 정확한 분할 시점을 좁힌다.
+**이상점 사전 제거 (강건화, 기존과 동일 메커니즘 유지)**: `separation_ratio` 계산에 쓰이는 `before`/`after`의 평균·분산은 여전히 **이상점을 제외하고** 낸다(`mad_outlier_mask`, §4.2-1 기존 로직 — `OUTLIER_MAD_K`/`OUTLIER_MAX_FRACTION` 그대로 재사용). §4.3의 `spike_count` 등 다른 용처와도 여전히 공용이다.
 
-**최소 구간 길이 (`MIN_SEGMENT_COUNT`, 개수 기준)**: 분할 후보는 양쪽 모두 데이터 개수가 `MIN_SEGMENT_COUNT` 이상이어야 인정한다. 시간이 아니라 **개수**로 잡는 이유는, 생산량이 적은 날은 시간 단위로 나눠도 특정 구간에 데이터가 거의 없을 수 있고, 그러면 그 구간의 avg/std 자체가 소표본이라 불안정해져서 엉뚱한 곳을 변경점으로 잘못 짚을 위험이 있기 때문이다.
+**실측 검증 — 여러 패턴에 대한 `separation_ratio` 값**:
 
-**최종 판정은 `diff_score`가 아니라 W-RIC(겹침도) 자체와 비교한다(사용자 확인).** `diff_score = -ln(W-RIC)`는 fine 탐색에서 후보 지점을 랭킹(가장 다른 지점 찾기)하는 데만 쓰고, 최종 승인 기준은 그 지점의 `W-RIC` 값이 `SEGMENT_CHANGE_THRESHOLD`(현재 0.1, 조정 가능)보다 **작은지**로 판단한다 — `W-RIC`은 §4.1-B의 `anomaly_score`와 같은 0~1 척도(작을수록 많이 다름)라 "겹침도가 몇 미만이면 변경점"으로 직관적으로 해석할 수 있기 때문이다. `-ln` 변환값(`diff_score`) 자체에 임계치를 걸면 값의 스케일이 직관적이지 않아, 처음엔 `0.1`을 `diff_score`에 그대로 적용했다가 변경점이 없는 순수 잡음 트레이스에서도 false positive가 남을 실측으로 확인했다(§6) — `math.exp(-diff_score)`로 W-RIC 값을 복원해 비교하는 지금 방식으로 해결했다. 지점을 넘으면 2개 세그먼트로 분리(`segmentation_applied=True`), 아니면 변경점 없음으로 하루 전체를 단일 세그먼트로 취급한다(`segmentation_applied=False`). 후보 지점이 여러 곳에서 유의미하게 나타나더라도 **가장 다른(W-RIC이 가장 작은) 지점 하나만 채택**한다 — 몇 개의 변경점이 있는지보다 "변경점이 있다는 사실" 자체가 중요하기 때문이다.
+| 패턴 | separation_ratio | 채택 여부(임계값 0.3) |
+|---|---|---|
+| 순수 잡음(변경점 없음) | 0.004 ~ 0.016 | 미채택(정상) |
+| 원래 산포가 넓은 정상 데이터(std=4) | 0.004 ~ 0.016 | 미채택(정상 — §1.1 설계 철학과 일치) |
+| 단발 스파이크 1개 | 0.000 ~ 0.011 | 미채택(정상, MAD 제외로 안 흔들림) |
+| 미세한 drift(총 변화량 < ref_std) | 0.03 ~ 0.09 | 미채택 |
+| **완만한 drift(개정 계기가 된 사례)** | **0.40 ~ 0.44** | **채택 — 구 방식은 미채택이었음** |
+| 평탄-완만한 램프-평탄(2레벨+전이) | 0.66 ~ 0.68 | 채택 |
+| 즉시 계단 변화(대조군) | 0.74 ~ 0.78 | 채택 |
+
+**알려진 한계(숨기지 않고 기록)**: 하루 안에 **1주기 미만**만 관측되는 주기성 데이터(예: 반나절 동안 오르기만 하다 끝나는 사인파의 상승 구간만 보이는 경우)는 완만한 drift와 원천적으로 구분이 안 된다(실측: 이런 경우 separation_ratio가 0.80까지도 나올 수 있음) — 하루 단위 윈도우만으로는 "계속 오르는 추세인지, 원래 오르내리는 주기 중 오르는 구간만 걸린 건지" 판단할 정보 자체가 없기 때문이다. 이건 이 알고리즘의 결함이 아니라 하루 단위 윈도우의 근본적 정보 한계라, 별도로 손댈 수 있는 부분이 아니다.
+
+**세그먼트 개수는 여전히 최대 2개(worst/other)로 유지한다(사용자 확인)** — change point가 여러 레벨(N개)을 거치는 데이터라도, §4.4-0의 Cpk 계산은 지금처럼 "변경점 앞/뒤 2구간" 구조를 그대로 쓴다. N개 세그먼트로 일반화하는 것은 이번 개정 범위가 아니다.
+
+**향후 방향(사용자 확인, 이번 범위 아님)**: change point 탐지가 장기적으로 세그먼트 분할의 유일한 판단 기준이 되어, "change point 여부"를 다른 어떤 분석(§4.4-0 Cpk 계산 등)보다도 먼저 판단하는 구조로 재정리하는 방향이 논의됐다. 지금은 파이프라인상 이미 `_compute_group`에서 change point 탐지가 세그먼트 분할/ML feature 추출/shape 분류보다 먼저 실행되므로 구조적으로는 이미 그 방향에 가깝지만, 명시적인 재설계는 별도 작업으로 남겨둔다.
 
 **처리 흐름**
 
@@ -388,9 +400,9 @@ flowchart TD
     A["하루 tsum 데이터 개수 확인"]
     B["판정: 데이터 개수 < 2×MIN_SEGMENT_COUNT ?"]
     C["변경점 없음<br/>(세그먼트 1개, segmentation_applied=False)"]
-    D["Coarse 탐색<br/>시간 단위 경계별 diff_score 계산 → 최댓값 위치"]
-    E["Fine 탐색<br/>coarse 위치 주변에서 포인트 단위로 diff_score 재탐색"]
-    F["판정: 그 지점 W-RIC(=exp(-diff_score)) < SEGMENT_CHANGE_THRESHOLD ?"]
+    D["ruptures.Binseg(model=l2, min_size=MIN_SEGMENT_COUNT)<br/>predict(n_bkps=1) → 분할점 1개"]
+    E["그 분할점의 separation_ratio 계산<br/>(이상점 제외 후 집단간분산/전체분산)"]
+    F["판정: separation_ratio >= CHANGE_POINT_SEPARATION_THRESHOLD ?"]
     G["변경점 확정<br/>해당 지점에서 2개 세그먼트로 분리 (segmentation_applied=True)"]
 
     A --> B
@@ -410,7 +422,7 @@ flowchart TD
 | :--- | :--- | :--- | :--- |
 | **규격 초과** | `lsl_violations` / `usl_violations` | **원본** | 위반 횟수·비율 |
 | | `max_out_magnitude` | **원본** | 최대 이탈 거리 |
-| **변동성/스파이크** | `spike_count` | 이상치 탐지 결과 | 세그먼트 내 이상점으로 걸러진 포인트 개수 (§4.2와 동일 기준: `\|x-median\| > OUTLIER_MAD_K*scale`, `scale`=MAD 또는 MAD=0일 때 std) |
+| **변동성/스파이크** | `spike_count` | 이상치 탐지 결과 | 세그먼트 내 이상점으로 걸러진 포인트 개수 (§4.2와 동일 기준: `\|x-median\| > OUTLIER_MAD_K*scale`, `scale`=MAD 또는 MAD=0일 때 std, `OUTLIER_MAX_FRACTION` 상한 적용) |
 | | `step_change_flag` | 이상점 제거 | 세그먼트 전/후 평균 이동 |
 | | `data_drift_slope` | 이상점 제거 | 세그먼트 내 회귀 기울기(단위시간당 변화량) |
 | | `drift_total_change` | 이상점 제거 | `data_drift_slope × 관측시간` — 세그먼트 전체 기간에 걸친 총 변화량. "완만한 trend" 판정(§4.4-B, `TREND_REF_STD_RATIO`)에 기울기 대신 이 값을 `ref_std` 대비 비율로 사용한다 — 기울기(단위시간당 변화량)만 보면 값 스케일에 따라 커 보이거나 작아 보여 "육안으로 확인 가능한 수준"과 안 맞을 수 있어서다 |
@@ -523,7 +535,7 @@ anomaly_agent/
 │   ├── input/                 # tttm CSV(§2.4) — PoC 초기엔 기본 경로였으나 지금은 DB(load_tttm_window)가 기본, 오프라인 개발용으로 유지
 │   └── output/
 │       ├── charts/            # NG/PENDING_REVIEW 트레이스 PNG (§2.3, 잠정)
-│       ├── results.db         # §2.3 tb_anomaly_detection_raw (SQLite, UPSERT)
+│       ├── results.db         # §2.3 tb_anomaly_detection_raw + §7.2 tb_tsum_ml_features + §7.3 tb_tsum_shape_classification (SQLite)
 │       └── ...                # 일별 md 리포트 (디스크에 남는 건 이것뿐)
 ├── src/
 │   ├── app_logging.py         # §5.4: 실행 로그 설정 (main.py 시작 시 1회 init_logging() 호출)
@@ -533,6 +545,8 @@ anomaly_agent/
 │   ├── segmenter.py           # §4.2: 변화점 기반 세그멘테이션
 │   ├── feature_tsum.py        # §4.3: 세그먼트별 피처 추출기
 │   ├── classifier.py          # §4.4: Rule 최종 분류 + description 생성 (A~B). ML(§7)은 범위 제외
+│   ├── ml_features.py         # §7.2: ML 도입 사전 준비 — tsum 하루 전체 raw 트레이스에서 feature 추출
+│   ├── shape_classifier.py    # §7.3: ml_features 기반 센서 형태(shape_category) 결정론적 분류기
 │   ├── calibration.py         # 키별 임계값 자체 보정 — 함수는 완성/테스트됐으나 CALIBRATION_PERCENTILE 미정이라 아직 GUI에 미연동(Phase 7 대기)
 │   ├── visualizer.py          # §2.3: 트레이스/오버랩/일간추이 PNG 생성 (matplotlib, 잠정)
 │   ├── result_store.py        # §2.3: results.db 읽기/UPSERT (Tab 2 저장, Tab 3 조회)
@@ -540,7 +554,7 @@ anomaly_agent/
 │   ├── synthetic_data.py      # 테스트/데모용 tttm·tsum 합성 데이터 생성기 (Phase 1, 실측 데이터 아님)
 │   └── gui/                   # §5.3: PySide6 3탭 화면
 │       ├── main_window.py     # 3탭(QTabWidget) 구성 + AppState 공유
-│       ├── common.py          # AppState, CheckableComboBox, ui_filters.json 로딩
+│       ├── common.py          # AppState, CheckableComboBox, ui_filters.json 로딩, enable_table_copy(표 Ctrl+C 복사)
 │       ├── pipeline.py        # Tab1/2 오케스트레이션 (Qt 비의존) — DatasetARow, run_tab1_pipeline/run_tab2_pipeline
 │       ├── tab1.py            # Tab 1: tttm 조회/1차 판정
 │       ├── tab2.py            # Tab 2: tsum 분석 대상 선택/2차 판정
@@ -609,7 +623,7 @@ Python GUI는 **PySide6**로 만든다 — 탭, 멀티셀렉트 드롭다운, �
     ```
   - `STAGE`는 §2.3 `stage` 필드로 필터링하는 용도이며, 선택지는 config가 아니라 코드에 고정값으로 둔다 — `stage`는 사이트마다 달라지는 데이터가 아니라 고정된 스키마 enum이기 때문이다. 목록은 실제로 쓰이는 값만 담는다: `EXCLUDED` / `NOT_APPLICABLE` / `RULE_OK` / `RULE_NG` (`ML_CLASSIFIED`는 예약값이라 이번 구현 범위에서 쓰이지 않으므로 제외, §7). **`STAGE`만 기본값이 `RULE_NG`로 미리 체크돼 있다(신규, 사용자 요청)** — Tab2는 애초에 tsum 분석 대상(`RULE_NG`)을 고르는 화면이라, 매번 직접 체크하지 않아도 바로 그 대상만 보이게 했다. `LINE`/`PART`/`GRADE`는 여전히 기본 "ALL"이다.
 - **목록**: 데이터셋 A 전체를 위 4개 필터로 좁혀서 표시하고, 각 행 맨 앞에 체크박스를 둔다. 체크 후 [분석]을 눌러도 `stage != RULE_NG`인 행은 tsum 분석 대상에서 자동으로 제외된다(`run_tab2_pipeline`, §2.4) — 화면에서 굳이 `RULE_NG`로 미리 걸러두지 않아도 안전하다. 목록 위에 **"전체 선택" 체크박스(신규)**가 있어, 한 번에 화면에 보이는 모든 행을 체크/해제할 수 있다 — [필터 적용]으로 목록이 바뀌면 이 체크박스도 자동으로 해제 상태로 초기화된다(실제 행별 체크 상태와 표시가 어긋나지 않게).
-- **표(Tab 1/2/3 공통, 신규, 사용자 요청)는 전부 읽기 전용이다** — 체크박스 칸(Tab 2)만 예외고, 나머지 셀은 더블클릭해도 상세 팝업만 뜰 뿐 텍스트를 직접 고칠 수 없다. `final_class` 등 값 수정은 상세 팝업(아래, `PENDING_REVIEW` 한정)에서만 하도록 통일했다 — 예전엔 Qt 기본 동작상 셀 더블클릭이 상세 팝업을 띄우는 동시에 셀 자체도 편집 모드로 들어갈 수 있어서(수정해도 어디에도 반영되지 않는 죽은 편집), 명시적으로 막았다.
+- **표(Tab 1/2/3 공통, 신규, 사용자 요청)는 전부 읽기 전용이다** — 체크박스 칸(Tab 2)만 예외고, 나머지 셀은 더블클릭해도 상세 팝업만 뜰 뿐 텍스트를 직접 고칠 수 없다. `final_class` 등 값 수정은 상세 팝업(아래, `final_class`가 있는 모든 항목 대상 — 신규·사용자 요청으로 `PENDING_REVIEW` 한정에서 확대됨)에서만 하도록 통일했다 — 예전엔 Qt 기본 동작상 셀 더블클릭이 상세 팝업을 띄우는 동시에 셀 자체도 편집 모드로 들어갈 수 있어서(수정해도 어디에도 반영되지 않는 죽은 편집), 명시적으로 막았다.
   - **화면 표시 컬럼**: 체크박스 다음으로 `rpt_day`(신규, Tab 1/2/3 공통), 그 다음 `unique_key_id`를 구성하는 9개 컬럼(`line`/`part`/`area`/`eqpid`/`tttm_property`/`param_name`/`tsum_type`/`grade`/`recipe`)을 그대로 펼쳐서 보여주고, 이어서 §4.1-B 1차 판정에 쓰인 값(`avg`/`std`/`ref_avg`/`ref_std`/`anomaly_score`)을 표시해 사람이 어떤 항목을 체크해 tsum 분석까지 돌릴지 판단할 근거로 삼게 한다. 마지막으로 `stage`/`final_class`/`confidence`/`description`을 표시한다.
 - **[분석] 버튼**: 체크된 항목만 골라 아래를 순서대로 실행하고, 마찬가지로 단계별 진행 상태를 표시한다:
   ```
@@ -635,12 +649,18 @@ Python GUI는 **PySide6**로 만든다 — 탭, 멀티셀렉트 드롭다운, �
      - **"라이브 차트 보기"(신규)**: `AppState.tsum_raw`가 세션 동안 이미 메모리에 있으므로 추가 조회 없이, matplotlib을 Qt 위젯(`FigureCanvasQTAgg`)으로 직접 임베드한 인터랙티브 차트를 별도 팝업으로 띄운다 — `NavigationToolbar2QT`로 확대/축소/이동이 되고 좌표를 마우스로 호버해 정확한 값을 볼 수 있다. 그려지는 내용(세그먼트 강조/이상점 마커/`lsl`/`usl`/`target`/`ref_avg±ref_std`)은 정적 PNG와 기본적으로 같은 정보를 담지만, `draw_trace_chart(..., show_markers=True)`로 **선을 더 가늘게 하고 실측 지점마다 점(타점)을 찍는다(신규, 사용자 요청, 라이브 차트 전용)** — 선만 그리면 "원래 고정값이라 평평한 것"과 "데이터가 띄엄띄엄 보고돼서 평평해 보이는 것"을 구분할 수 없어서다. 정적 PNG(`render_trace_chart`)는 타점 없이 기존 그대로 유지한다(둘 다 `visualizer.py`의 `draw_trace_chart(ax, ...)`를 공유하되 `show_markers` 플래그만 다르게 호출). 세그먼트 강조에 필요한 `change_point_index`/`worst_segment_index`는 `DatasetARow`의 신규 세션 전용 필드로 `_classify_row`가 채운다(다른 정보 패널 필드들과 같은 패턴, DB에는 저장 안 됨).
      - 둘 다 raw tsum이 없으면(분석 전이거나 이 세션에서 조회하지 않았으면) 버튼이 비활성화된다. 정적 PNG는 `chart_path`로 DB/Tab3에 남는 "기록"이고, 라이브 차트는 이 세션 중 탐색용으로만 쓰이며 저장되지 않는다.
      - **트레이스 차트 왼쪽에 수치 정보 패널(신규)**: 차트가 800px 고정폭이라 1300px 팝업을 다 못 채워 남는 왼쪽 공간에, `description` 문장을 다시 읽지 않아도 되도록 분석 수치를 그대로 나열한다 — 데이터 개수(`n_points`)/세그먼트 개수, `ref`(`ref_avg`±`ref_std`) / `comp`(당일 `avg`±`std`), `ref_cpk`/`ref_cpk*`/`ref_cpm`, worst 세그먼트 `cpk`/`cpm`, 기울기(`data_drift_slope`)/하루 총 변화량(`drift_total_change`), 스파이크 횟수, `skewness`/`kurtosis`(`detail_dialog.py`의 `_format_feature_summary`). 이 값들은 `DatasetARow`에 담기지만 `result_store.py`의 `SCHEMA_COLUMNS`에는 없어 **DB에는 저장되지 않는다** — `AppState.tttm_window`/`tsum_raw`와 같은 "Tab2 [분석]을 거친 세션에서만 채워지는" 패턴이라, Tab3에서 과거 저장 결과를 다시 열면 이 패널은 빈 상태 안내만 표시된다.
-  - `final_class=PENDING_REVIEW`인 경우에 한해 팝업에서 판정을 직접 수정할 수 있다 — 이게 §6에서 미정으로 남겨뒀던 "엔지니어 라벨링 수단"의 구체적 형태다. 수정 결과는 `engineer_label`(§7 ML용으로도 재사용)에 반영되고, 수정 시각을 `modified_at`(신규 필드, §2.3)에 기록한다. `OK`/`NG`로 이미 Rule이 확정한 건은 이 팝업에서 수정 대상이 아니다(V1 범위).
+  - **`final_class`가 있는 항목이면(가성/진성-조치불필요/진성-조치필요/`PENDING_REVIEW` 무관) 팝업에서 판정을 직접 수정할 수 있다(신규·사용자 요청 — 이전엔 `PENDING_REVIEW`만 수정 가능했으나 HITL 범위를 전체 판정으로 확대함)** — 이게 §6에서 미정으로 남겨뒀던 "엔지니어 라벨링 수단"의 구체적 형태다. 수정 콤보박스는 현재 `final_class`를 기본 선택값으로 미리 채워 보여준다(`PENDING_REVIEW` 자체는 선택지에 없으므로 그 경우만 첫 항목이 기본값). 수정 결과는 `engineer_label`(§7 ML용으로도 재사용)에 반영되고, 수정 시각을 `modified_at`(신규 필드, §2.3)에 기록한다.
 - **산출물 — 데이터셋 B(2차 판정 데이터셋)**: 데이터셋 A의 `RULE_NG` 서브셋에 세그먼트/피처/최종 `final_class`/`description`/(수정됐다면 `modified_at`)가 채워진 것. 마찬가지로 GUI 세션 메모리에 보관한다.
 
 #### 최종 저장
 
-Tab 2에 **[저장]** 버튼을 두고, 클릭 시 데이터셋 A(비-NG 항목 전체)와 데이터셋 B(그때까지 분석된 NG 항목)를 합쳐 `tb_anomaly_detection_raw`(§2.3, SQLite)에 UPSERT한다. 아직 체크해서 분석하지 않은 `RULE_NG` 항목도 "분석 대기" 상태 그대로 같이 저장해둔다 — `description`에 `"tsum 분석 미진행"`을 기록해 나중에 Tab 3에서 조회해도 아직 분석 전이라는 걸 알 수 있게 한다(§2.3). 나중에 마저 분석하거나 사람이 `PENDING_REVIEW`를 수정했을 때 같은 `(eval_date, unique_key_id)`로 다시 UPSERT하면 그만이라, 저장을 여러 번 나눠 눌러도 문제없다.
+Tab 2에 **[저장]** 버튼을 두고, 클릭 시 데이터셋 A(비-NG 항목 전체)와 데이터셋 B(그때까지 분석된 NG 항목)를 합쳐 `tb_anomaly_detection_raw`(§2.3, SQLite)에 저장한다. 아직 체크해서 분석하지 않은 `RULE_NG` 항목도 "분석 대기" 상태 그대로 같이 저장해둔다 — `description`에 `"tsum 분석 미진행"`을 기록해 나중에 Tab 3에서 조회해도 아직 분석 전이라는 걸 알 수 있게 한다(§2.3). 같은 날짜를 저장을 여러 번 나눠 눌러도(마저 분석 후 재저장 등) 문제없도록, **저장은 그 `eval_date`의 기존 저장분을 전부 지우고 현재 세션의 데이터셋 A로 새로 채우는 방식(delete-then-replace, 신규·사용자 요청)이다** — 병합(UPSERT)이 아니다. Tab 1은 매번 그 날짜 전체를 재조회/재계산하는 stateless 구조라, 재저장 시점의 데이터셋 A가 그 날짜의 최신·완전한 판정 결과이기 때문이다. 병합만 하면, 이전 저장 이후 `recipe`/`grade` 등이 바뀌어 `unique_key_id`가 달라진 옛 저장분이 이번 세션의 데이터셋 A에는 없는 채로 DB에 죽어서 계속 남는 문제가 있었다. **이 방식의 트레이드오프**: 같은 `unique_key_id`를 재저장해도 `created_at`이 최초 저장 시각이 아니라 재저장 시각으로 새로 찍힌다(예전 UPSERT 방식은 `created_at`을 보존했음). Tab 3의 `PENDING_REVIEW` 단건 수정 저장은 세션에 그 한 건만 있으므로 이 방식이 아니라 기존처럼 `upsert_result`(단건 UPSERT, `created_at` 보존)를 그대로 쓴다 — 그렇지 않으면 Tab 3이 조회하지 않은 그 날짜의 나머지 저장 데이터가 삭제되어 버린다.
+
+**저장/조회 실패 시에도 앱이 죽지 않는다(신규, 사용자 리포트로 수정).** [저장] 버튼을 눌렀을 때 아무 로그도 없이 앱이 죽는 문제가 보고됐다 — 원인은 `save_results()`에 예외 처리가 전혀 없어서, DB 파일이 잠겨 있거나(다른 프로세스가 쓰는 중 등) 어떤 이유로든 쓰기가 실패하면 Qt 슬롯 안에서 처리 안 된 예외가 그대로 올라가 앱 자체가 죽었기 때문이다(로그를 남기는 코드에 도달하기도 전에 죽으므로 "로그도 안 남고 죽는" 증상과 일치). Tab1의 DB 조회, Tab2의 tsum 분석과 동일하게 **저장(Tab2)과 조회/PENDING_REVIEW 수정 저장(Tab3)에도 try/except를 추가**해, 실패해도 사유(예외 타입+메시지)가 상태줄과 로그에 남고 앱은 계속 쓸 수 있다. 콘솔 인코딩 문제(§5.4)도 같은 조사에서 함께 발견/수정됐다.
+
+**저장 성능(사용자 리포트로 발견/수정) — 건별 커밋이 병목이었다.** 4만 건 저장이 너무 오래 걸린다는 리포트를 받고 `result_store.py`를 확인해보니, `upsert_result()`가 **호출마다 `conn.commit()`을 실행**하고 있었다 — Tab2 `save_results()`가 행마다 이 함수를 반복 호출하니, 결과적으로 4만 번의 개별 커밋이 발생한다. SQLite는 커밋마다 디스크 fsync를 강제하므로, 이 방식은 건수가 늘어날수록 선형으로 느려진다(로컬 SSD 실측: 4만 건에 약 184초 — 사용자 환경은 디스크/백신 등에 따라 훨씬 더 걸렸을 수 있다). **`replace_eval_date_results(conn, eval_date, rows)`를 추가**해 그 `eval_date`의 기존 행을 `DELETE`한 뒤 새 행들을 `executemany`로 넣는 전체를 **커밋 1회**(하나의 트랜잭션)로 처리하도록 바꿨다 — 같은 4만 건이 실측 약 0.5초로 끝난다(약 370배 개선). DELETE+INSERT가 한 트랜잭션 안에 있으므로 중간에 실패해도 기존 데이터가 삭제된 채로 남지 않는다(원자적). 단일 행만 수정하는 Tab3의 `PENDING_REVIEW` 수정 저장 등은 기존처럼 `upsert_result`(단건 UPSERT, 즉시 커밋)를 그대로 쓴다 — 한 번에 한 건뿐이라 배치/교체의 이점이 없고, 그때그때 바로 반영되며 `created_at`도 보존되는 편이 더 자연스럽다.
+
+**세 테이블을 하나의 트랜잭션으로.** Tab2 [저장]은 이제 `tb_anomaly_detection_raw`뿐 아니라 §7.2/§7.3의 `tb_tsum_ml_features`/`tb_tsum_shape_classification`도 같이 채운다 — 세 `replace_eval_date_*` 호출을 전부 `commit=False`로 실행한 뒤 커넥션에서 커밋을 1번만 호출해, 판정 결과만 갱신되고 ML feature/shape 분류는 옛 상태로 남는 불일치가 생기지 않게 한다.
 
 #### Tab 3. 결과 조회
 
@@ -648,9 +668,9 @@ Tab 2에 **[저장]** 버튼을 두고, 클릭 시 데이터셋 A(비-NG 항목 
 
 - **상단 메뉴 영역**(Tab 1/2와 같은 위치): 날짜 범위(`eval_date` from~to) + `LINE`/`PART`/`GRADE`/`JUDGE` 멀티셀렉트 필터(`ui_filters.json` 재사용). Tab 2의 `STAGE` 필터와 달리 여기 `JUDGE`는 (Tab2와 다른 용도로) 계속 `final_class` 값으로 필터링한다 — Tab 3은 이미 저장된 결과 전체(OK/`EXCLUDED_*`/`MATRIX_*` 포함)를 대상으로 하므로 `stage`가 아니라 최종 판정(`final_class`)으로 좁혀보는 쪽이 더 유용하기 때문이다.
 - **목록**: 조건에 맞는 결과를 `tb_anomaly_detection_raw`에서 조회해 표시.
-- **더블클릭 팝업**: Tab 2와 동일한 팝업(description/feature/`chart_path` 트레이스 차트)을 그대로 재사용한다. `final_class=PENDING_REVIEW`면 여기서도 수정 가능하고, 수정 시 `modified_at`을 갱신한다 — Tab 2에서 그날 못 보고 넘어간 `PENDING_REVIEW` 건을 나중에 다시 검토할 수 있게 하기 위함이다.
+- **더블클릭 팝업**: Tab 2와 동일한 팝업(description/feature/`chart_path` 트레이스 차트)을 그대로 재사용한다. `final_class`가 있는 항목이면 여기서도 수정 가능하고(§5.3 Tab 2 참고 — `PENDING_REVIEW` 한정에서 전체 판정으로 확대됨), 수정 시 `modified_at`을 갱신한다 — Tab 2에서 그날 못 보고 넘어간 `PENDING_REVIEW` 건이나, 이미 확정된 판정을 나중에 다시 검토/정정할 수 있게 하기 위함이다.
 
-### 5.4 실행 로그 (신규)
+### 5.4 실행 로그
 
 문제가 생겼을 때 로그 파일 하나만 보고도 무슨 일이 있었는지 재구성해서 대화할 수 있게 하는 게 목적이다.
 
@@ -662,6 +682,7 @@ Tab 2에 **[저장]** 버튼을 두고, 클릭 시 데이터셋 A(비-NG 항목 
   - tsum spec/no-spec 조회(§2.4 그룹핑)는 그룹(테이블 쌍)이 몇 개라 최대 몇 번(그룹당 spec/no-spec 2회) 시도하는지, 그리고 **시도하지 않은 경우 그 사유**까지 남긴다 — 예: `"no-spec 조회 시도 안 함(사유): spec 테이블에서 대상 조합 N개를 전부 찾아 no-spec 조회가 필요 없음"`. spec에서 일부만 찾았을 때는 몇 개를 찾았고 몇 개가 남아 no-spec으로 넘어가는지도 기록한다.
 - **정리**: 실행할 때마다 48시간 지난 `.log` 파일은 자동으로 지운다.
 - **git 제외**: `log/`는 접속 정보/쿼리가 그대로 남으므로 `.gitignore` 대상이다 — 폴더 구조만 `.gitkeep`으로 유지(`credentials.yaml`/`tsum_tables.yaml`과 같은 방식).
+- **콘솔 인코딩 안전장치(신규, 사용자 리포트로 발견)**: Tab2 [저장]이 아무 로그도 안 남기고 죽는 문제를 조사하다가, 콘솔이 UTF-8이 아닌 환경(예: 한국어 Windows 콘솔의 cp949)에서는 로그 메시지에 "⚠" 같은 기호가 섞이면 **로깅 자체가 `UnicodeEncodeError`로 죽어버리는** 문제를 재현했다 — 로그를 남기려던 호출이 오히려 앱을 죽이는 역설이었다. `init_logging()`이 `sys.stdout`/`sys.stderr`를 `errors="backslashreplace"`로 재설정해, 인코딩 불가 문자는 예외 대신 이스케이프 표기(`⚠` 등)로 콘솔에 대체 출력되게 했다 — 로그 파일(항상 UTF-8)에는 영향 없이 실제 문자 그대로 남는다.
 
 ---
 
@@ -669,12 +690,12 @@ Tab 2에 **[저장]** 버튼을 두고, 클릭 시 데이터셋 A(비-NG 항목 
 
 > `threshold_reference.csv`(§3)의 "상태"가 확정이 아닌 값(확정 필요/미정/잠정값)만 나열한다. `SPIKE_TOLERANCE`처럼 이미 "확정" 상태인 값은 CSV가 상태를 직접 추적하므로 여기 중복 나열하지 않는다. `ref_cpk`/`ref_cpk*`(§4.4-0)는 CSV 상수가 아니라 매번 계산되는 값이라 이 목록과 무관하다.
 
-- §3의 "상태 = 확정 필요/미정"인 값들(`CONST_STD_THRESHOLD`, `CALIBRATION_PERCENTILE`, `DRIFT_SLOPE_THRESHOLD`, `MIN_REF_COUNT_FOR_MATRIX`)은 실제 데이터로 검증 후 확정 필요. `OUTLIER_MAD_K`(3.0→4.0)와 `TREND_REF_STD_RATIO`(0.3, 신규)는 스파이크 과다검출/trend 오판정 이슈로 사용자가 잠정값을 지정했으나 여전히 "확정"은 아니고 실측 데이터로 재검토가 필요하다. (`MIN_REF_COUNT`=2, `MIN_PROD_CNT`=50, `CONST_HISTORY_RATIO`=0.5는 확정됨)
+- §3의 "상태 = 확정 필요/미정"인 값들(`CONST_STD_THRESHOLD`, `CALIBRATION_PERCENTILE`, `DRIFT_SLOPE_THRESHOLD`, `MIN_REF_COUNT_FOR_MATRIX`)은 실제 데이터로 검증 후 확정 필요. `OUTLIER_MAD_K`(3.0→6.0)/`OUTLIER_MAX_FRACTION`(0.05, 신규)과 `TREND_REF_STD_RATIO`(0.3, 신규)는 스파이크 과다검출/trend 오판정 이슈로 사용자가 잠정값을 지정했으나 여전히 "확정"은 아니고 실측 데이터로 재검토가 필요하다. (`MIN_REF_COUNT`=2, `MIN_PROD_CNT`=50, `CONST_HISTORY_RATIO`=0.5는 확정됨)
 - `config/tsum_tables.yaml`(§2.4, `.gitignore` 대상 — 템플릿은 `tsum_tables.example.yaml`)의 실제 값 — 지금은 `line` 그룹(A/B/C 예시)별 `tsum_A_spec`/`tsum_A_nospec` 등 nickname 라우팅만 들어 있다(placeholder). 실제 운영 line 매핑(A/B/C 외 다른 그룹이 있는지 포함)이 확정되는 대로 이 파일을 갱신하면 된다. 실제 테이블명(스키마 포함, 예: `use_a.tsum_spec_a`)은 `credentials.yaml`(`credentials.example.yaml` 참고)의 해당 nickname 블록 `table` 필드에서 관리하므로 — 실제 테이블명이 바뀌면 `credentials.yaml`만 고치면 되고, nickname 자체를 바꿀 때만 두 파일을 같이 맞추면 된다.
 - `ref_count`가 작은 콜드스타트 키에서 고정값/변동값 이력 타입 판정이 얼마나 자주 뒤집히는지, 이게 실제로 문제가 되는지는 Phase 1 백테스트로 확인 필요 — 확인 결과에 따라 §4.1-A.3의 `MIN_REF_COUNT_FOR_MATRIX`(매트릭스 판정을 적용할 최소 `ref_count`, 미만이면 §4.1-B로 직행) 값을 정한다.
 - `TARGET_REF_COUNT`(현재 7)는 원래 근거(robust 통계용)가 지금 설계엔 더 이상 적용되지 않아 잠정값이다. 일단 7로 시작하고, 실제 적용하면서 기간을 늘리는 방안을 검토한다(§4.1-0 참고).
-- 세그멘테이션 알고리즘(§4.2, coarse-to-fine 단일 변경점 탐지)은 확정됐으나, `MIN_SEGMENT_COUNT`는 실제 트레이스 샘플을 봐야 정할 수 있음. `SEGMENT_CHANGE_THRESHOLD`는 사용자가 "W-RIC이 0.1보다 작으면 변경점"이라는 기준으로 잠정값 0.1을 지정했으나(§4.2-1), 여전히 실측 데이터로 재검토 필요.
-- 엔지니어 라벨링 수단은 §5.3 Tab 2의 GUI 팝업 수정 기능으로 구체화됨(`PENDING_REVIEW` 한정, `modified_at` 기록). 세부 UI(팝업 레이아웃 등)는 구현 시 확정.
+- 세그멘테이션 알고리즘(§4.2-1, `ruptures` 기반 단일 변경점 탐지로 개정)은 구조가 확정됐으나, `MIN_SEGMENT_COUNT`는 실제 트레이스 샘플을 봐야 정할 수 있음. `CHANGE_POINT_SEPARATION_THRESHOLD`(신규, 0.3)는 여러 합성 패턴 실측으로 잠정 지정했으나(§4.2-1), 실제 tsum 데이터로 재검토 필요.
+- 엔지니어 라벨링 수단은 §5.3 Tab 2의 GUI 팝업 수정 기능으로 구체화됨(`final_class`가 있는 모든 항목 대상, `modified_at` 기록 — 신규·사용자 요청으로 `PENDING_REVIEW` 한정에서 확대됨). 세부 UI(팝업 레이아웃 등)는 구현 시 확정.
 - §4.1-B 발견 3(`ref_std`가 작을 때의 과민 판정)에 대한 대응은 §4.4-0의 `ref_cpk`/`ref_cpk*` 자체 보정으로 구체화됐지만, 이게 실제로 파라미터별 마진 차이를 잘 흡수하는지, 사람의 `PENDING_REVIEW` 검토 부담을 감당 가능한 수준으로 유지하는지는 Phase 1 백테스트로 확인 필요.
 - 트레이스 차트(§2.3, PNG/matplotlib)는 표시 항목·형식 모두 잠정안이다 — 일단 이대로 만들어보고, 실제 써보면서 필요하면 다시 조정한다.
 - `ref_cpk`/`ref_cpk*`(tttm 원본 std)와 `worst_segment_cpk`(tsum 이상치 제거 std)의 산출 방식 비대칭(§4.4-0)이 `worst_segment_cpk`를 구조적으로 유리하게 만드는 정도는 Phase 1 백테스트로 실제 크기를 확인 필요.
@@ -683,7 +704,7 @@ Tab 2에 **[저장]** 버튼을 두고, 클릭 시 데이터셋 A(비-NG 항목 
 - `cpm`/`ref_cpm` 기반 Cpk 구제 규칙(§4.4-0/§4.4-A, `target` 있는 센서 한정)은 설계는 확정됐으나, 실제로 얼마나 자주 발동하는지·오탐을 줄이는 효과가 있는지는 Phase 1 백테스트로 확인 필요. `target`이 없는 센서가 흔해 전체 센서 중 이 규칙이 적용되는 비율 자체도 실측 필요.
 - §4.3에서 정규성 위반 여부와 무관하게 항상 `cpk` 공식을 그대로 쓰기로 했다(`ppk` 대체 없음) — 세그먼트 분포가 정규성을 크게 벗어나는 경우 `cpk` 값이 왜곡될 수 있다는 알려진 한계가 있으며, 실제 영향은 Phase 1 백테스트로 확인 필요.
 - §4.1-B `anomaly_score`를 W-RIC 그대로 쓰는 것으로 전환하면서 도입한 보조 지표 `-ln(W-RIC)`(`THETA_OVERLAP`이 0.1/0.001처럼 작아지는 구간에서 심각도 순위용)은 "언제부터 작다고 볼지" 구체적 기준이 아직 없다 — 실제 데이터로 `THETA_OVERLAP` 분포를 보고 확정 필요.
-- §4.2-1 coarse-to-fine 탐색을 합성 데이터로 구현·테스트하며 발견한 점: 실제 변경점에서 먼 후보 분할점이라도, 그 지점이 두 클러스터가 섞인 구간이면 MAD 이상치 제거가 소수 클러스터를 통째로 "이상치"로 걸러내며 diff_score가 인위적으로 커질 수 있다 — coarse-to-fine이 정확한 변경점 위치로 수렴한다는 보장이 약해질 수 있다는 뜻이다("변경점이 있다는 사실" 자체는 여전히 잘 잡힘). `OUTLIER_MAD_K`/`MIN_SEGMENT_COUNT` 실측 확정(Phase 1 백테스트) 시 이 상호작용도 같이 확인 필요.
+- §4.2-1을 `ruptures` 기반으로 개정하면서 "정확한 변경점 위치"까지는 검증하지 않았다 — 지금 테스트는 "변경점이 있다는 사실 자체가 검출되는지"만 확인한다(설계 목표와 일치). `OUTLIER_MAD_K`/`MIN_SEGMENT_COUNT`/`CHANGE_POINT_SEPARATION_THRESHOLD` 실측 확정(Phase 1 백테스트) 시 위치 정확도도 같이 확인 필요.
 - **tsum ref 구간(과거 데이터) 참고 표시 — 추후 개발 검토 항목(사용자 요청, 아직 미착수).** 지금 상세 팝업의 트레이스 차트(§2.3)는 분석에 쓰인 당일(1일)치만 보여준다. 여기에 "ref 구간(=`ref_avg`/`ref_std` 계산에 실제로 쓰인 과거 유효일, §4.1-0)의 tsum 원본 데이터도 참고용으로 같이 보여주면 어떨지" 검토했고, **분석·판정 입력은 지금처럼 당일 1일 데이터만 쓰고, 이건 순수 표시용으로만 추가한다는 전제**로 다음을 확인했다:
   - **핵심 난제**: 유효한 ref일(`select_valid_ref_rows`, `prefilter.py`)은 `unique_key_id`별로 다를 수 있는데(생산량 등 tttm 이력이 `part`/`grade`/`recipe`마다 다르므로), tsum은 (`chmbr_name`/`sensor_name`/`meas_type_id`) **그룹 단위로 공유 조회**한다(§2.4) — 그룹 안에서도 키마다 "유효했던 날짜"가 다를 수 있어, 그룹 공유 최적화와 정확한 ref일 매칭이 서로 충돌한다.
   - **해결 방향(사용자 제안)**: 이 유효 ref일 목록을 tsum 쪽에서 다시 계산/추정하지 말고, **이미 tttm 쪽(`prefilter.py`의 `select_valid_ref_rows`/`compute_ref_stats`)에서 확정된 날짜 목록을 그대로 tsum 히스토리 조회 함수에 넘겨받아 쓴다** — 그룹 공유 여부와 무관하게 항상 정확한 날짜를 쓸 수 있어 위 난제를 근본적으로 피해간다.
@@ -693,23 +714,89 @@ Tab 2에 **[저장]** 버튼을 두고, 클릭 시 데이터셋 A(비-NG 항목 
 
 ---
 
-## 7. ML 도입 (이번 구현 범위 제외)
+## 7. ML 도입
 
-**이번 구현 범위가 아니다.** 처음부터 ML을 쓰지 않고 Rule 기반으로 시작해 데이터가 쌓인 뒤 ML을 도입하기로 했다 — Phase 1은 Rule 기반(§4.4-A/B)으로만 동작하며, 아래 내용은 Phase 1에서 `engineer_label`이 충분히 쌓인 뒤에나 착수 여부를 검토할 별개 작업이다. §4.4에서 이 내용을 분리해 여기로 옮긴 이유는, 지금 구현할 것(Rule)과 나중에 검토할 것(ML)이 같은 장에 섞여 있으면 "이번에 뭘 만들면 되는지"가 흐려지기 때문이다.
+**ML 모델 학습·적용 자체는 이번 구현 범위가 아니다.** 처음부터 ML을 쓰지 않고 Rule 기반으로 시작해 데이터가 쌓인 뒤 ML을 도입하기로 했다 — Phase 1은 최종 판정을 Rule 기반(§4.4-A/B)으로만 내리며, §7.4의 모델 학습은 `engineer_label`이 충분히 쌓인 뒤에나 착수 여부를 검토할 별개 작업이다. §4.4에서 이 내용을 분리해 여기로 옮긴 이유는, 지금 구현할 것(Rule)과 나중에 검토할 것(ML 모델)이 같은 장에 섞여 있으면 "이번에 뭘 만들면 되는지"가 흐려지기 때문이다. 단, **§7.2/§7.3(feature 추출·센서 형태 분류)은 모델 학습을 준비하는 사전 작업으로 Phase 1에서 이미 구현했다** — 나중에 모델을 학습할 때 매번 tsum을 재조회/재계산하지 않도록, 지금부터 미리 쌓아두는 것이다.
 
-### 7.1 착수 조건
+### 7.1 착수 조건 (모델 학습)
 
-`tb_anomaly_detection_raw`에 엔지니어가 `engineer_label` 컬럼을 채우는 리뷰 파일(또는 사내 툴)을 통해 충분한 라벨 데이터가 축적되어야 한다(§6, 수단 자체는 Phase 1에서 이미 필요). 라벨이 없으면 이 장의 내용은 시작하지 않는다.
+`tb_anomaly_detection_raw`에 엔지니어가 `engineer_label` 컬럼을 채우는 리뷰 파일(또는 사내 툴)을 통해 충분한 라벨 데이터가 축적되어야 한다(§6, 수단 자체는 Phase 1에서 이미 필요). 라벨이 없으면 §7.4(모델 학습)는 시작하지 않는다.
 
-### 7.2 설계 개요
+### 7.2 tsum feature 사전 추출·저장 (Phase 1에서 구현)
+
+모델 학습/도입 자체는 §7.1 조건이 갖춰진 뒤의 별개 작업이지만, **feature 추출·저장만은 Phase 1(지금)부터 미리 해둔다** — tttm/tsum 원본은 로컬에 저장하지 않는 구조라(§2.4, README §5), 나중에 ML을 실제로 시작할 때 매번 tsum을 다시 조회해 재계산하는 대신, Tab2 [분석] 시점에 계산해둔 feature를 그대로 축적해두기 위함이다(사용자 확인 — 세션 한정으로 버리지 않고 DB에 누적).
+
+- **범위**: Rule 기반 판정(§4.2~§4.4)과는 독립적인 관심사다 — 세그먼트/규격(lsl/usl)과 무관하게, 그 `(eval_date, unique_key_id)`의 tsum **하루 전체 raw 트레이스**(세그먼트 분리 이전, 이상치 제거 없이 원본 그대로)가 "어떤 모양인지"만 본다. `src/ml_features.py`가 이 계산을 전담하며, `gui/pipeline.py`의 `_compute_group`이 tsum 그룹(§5.3, Tab2 [분석] 대상)마다 한 번씩 호출해 `GroupComputation.ml_features` / `DatasetARow.ml_features`에 담는다(다른 세션 한정 필드들과 같은 위치지만, 저장 시점에는 DB에 남는다는 점이 다름).
+- **7개 feature 그룹** (아래 §7.3의 8-카테고리 shape 분류기 입력이다):
+  1. **기본 분포 통계** (`basic_distribution_features`): `count`/`mean`/`median`/`std`/`min`/`max`/`range`/`p05`/`p25`/`p75`/`p95`/`iqr`/`skewness`/`kurtosis`. §4.3의 판정용 skewness/kurtosis(이상치 제거, worst 세그먼트 한정)와 달리 원본을 그대로 쓴다 — min/max/p05/p95 자체가 극단값을 보려는 목적이라 이상치를 제거하면 의미가 없어지기 때문.
+  2. **다봉성(multimodality)** (`multimodality_features`): KDE(가우시안 커널 밀도추정) 후 피크 탐색으로 `mode_count`/`mode_separation`을 뽑는다 — `SYMMETRIC_UNIMODAL`(봉 1개) vs `MULTI_LEVEL`(봉 2개 이상, 설비가 서로 다른 레벨을 오가는 신호) 구분용. scipy 기본 대역폭(Scott's rule)은 "멀리 떨어진 좁은 두 군집"에서 전체 표준편차 기준으로 과하게 넓게 잡혀 봉을 뭉개는 문제가 실측(그리드서치)으로 확인돼, 대역폭을 0.6배로 줄이고 prominence 기준(최대 밀도의 8%)을 함께 낮춘 조합을 쓴다(검증: 분리된 두 군집 15/15 정탐, 단봉 데이터 14/15 정탐 — 5% 미만 오탐은 잠정 수용).
+  3. **주기성** (`periodicity_features`): FFT 스펙트럼 기반(자기상관 피크피킹 대체, 사용자 요청) `dominant_period`/`spectral_concentration` — `PERIODIC` 판별용. tsum 보고 간격이 균일하지 않을 수 있어 FFT 전에 균일 그리드로 선형보간한다.
+  4. **추세** (`trend_features`): 단순선형회귀 `trend_slope`/`trend_r2` — `TREND` 판별용. §4.4-B의 `data_drift_slope`(worst 세그먼트, 이상치 제거)와 별개로 하루 전체 원본 기준.
+  5. **이산성(discreteness)** (`discreteness_features`): `unique_count`/`unique_ratio`/`mode_ratio`/`is_integer_like_ratio` — `FIXED_CONSTANT`/`FIXED_NEAR_FIXED`/`DISCRETE` 판별용.
+  6. **측정 해상도(resolution)** (`resolution_features`, **잠정 — 아직 실측 검증 전**): `detected_resolution`/`gap_consistency`/`resolution_fill_ratio` — "저해상도 연속형"(예: 0.1 단위로만 찍히는 센서)과 진짜 `DISCRETE`를 구분하는 보조 feature. 실측 데이터로 검증 후 조정 필요.
+  7. **Change point** (`change_point_features`): §4.2-1의 `segmenter.detect_change_point`가 이미 찾아둔 분할점(`SegmentationResult.best_index`, 신규 필드 — Rule 세그멘테이션 채택 여부와 무관하게 항상 채워짐)을 재사용해 `has_change_point`/`change_point_index`/`level_shift_score`(레벨 이동 정도)/`var_shift_score`(분산 이동 정도)를 연속값으로 뽑는다. **8-카테고리 분류기와는 별개의 관심사(자체 게이팅용 orthogonal flag)로 취급하며, `shape_category` 값 자체는 아니다** — "변경점이 있었지만 Rule 문턱값(`CHANGE_POINT_SEPARATION_THRESHOLD`)엔 못 미쳐 세그멘테이션은 안 한" 경우도 연속값으로는 구분 가능해야 하기 때문이다.
+- **저장**: `result_store.py`의 별도 테이블 **`tb_tsum_ml_features`**(PK `(eval_date, unique_key_id)`, `line`/`part` 등 키 컬럼은 없음 — 필요하면 같은 키로 `tb_anomaly_detection_raw`와 조인)에 저장한다. **메인 판정 테이블과 분리한 이유**: ML feature는 이번 목록도 "잠정"이 섞여 있듯 앞으로 자주 추가/변경될 것으로 예상되는데, 메인 판정 스키마(`tb_anomaly_detection_raw`)에 매번 컬럼을 추가/삭제하면 마이그레이션 churn이 커진다. Tab2 [저장] 시점에 `replace_eval_date_results`(§5.3 최종 저장)와 같은 delete-then-replace 방식(`replace_eval_date_ml_features`)으로 갱신하되, 두 테이블을 하나의 트랜잭션(커밋 1회)으로 묶어 원자적으로 처리한다(`commit=False`로 각각 호출 후 커넥션에서 커밋 1번) — 판정 결과만 갱신되고 ML feature는 옛날 그대로인 상태가 남지 않게 하기 위함이다. `final_class`가 없는 항목(OK/EXCLUDED/tsum 분석 미진행)은 애초에 tsum을 조회하지 않거나 세그먼트 feature가 없으므로 이 테이블에도 저장하지 않는다.
+
+### 7.3 tsum 센서 형태(shape_category) 분류기 (Phase 1에서 구현)
+
+§7.2의 feature를 입력받아 8개 형태 카테고리 또는 `PENDING`(확신 없어 사람에게 넘김) 중 하나로 분류하는 결정론적 규칙 함수. **원안은 LLM 프롬프트 형태로 제시됐으나, 이 프로젝트는 로컬·서버 없음 원칙(§1.2)과 전부 결정론적 Rule(§4.4의 `classifier.py`와 동일 패턴)로 동작하는 구조라, LLM 호출 없이 숫자 비교만으로 동작하는 순수 함수로 번역해 구현한다** — 매 센서 건당 API 호출 비용/지연/비결정성을 피하기 위함(사용자 확인). `classifier.py`(Rule 최종 판정, `final_class`)와는 독립적인 별도 관심사이며 서로 관여하지 않는다.
+
+- **모듈**: `src/shape_classifier.py`. 상수: `SYMMETRIC_UNIMODAL`/`SKEWED`/`MULTI_LEVEL`/`FIXED_CONSTANT`/`FIXED_NEAR_FIXED`/`DISCRETE`/`TREND`/`PERIODIC`(8종) + `PENDING`(9번째 값, 아래 참고) = `shape_category`, `CHANGE_POINT`(`shape_category`가 아니라 `candidate_shape_category` 전용값, 2단계 참고).
+- **별도 `status` 필드는 두지 않는다(신규, 사용자 요청)** — 원안엔 `shape_category`(8종|null) + `status`(`CONFIRMED`/`PENDING_REVIEW`/`INSUFFICIENT_DATA`) 두 축이 있었지만, "분류 항목에서 분류가 안 되면 그 자체로 `PENDING`으로 분류"하도록 단일 축으로 합쳤다 — `shape_category`는 항상 9종 중 하나이고 `None`이 되는 경우가 없다. `INSUFFICIENT_DATA`도 별도로 두지 않는다(사용자 확인: 이 분류기가 도는 시점(Tab2 [분석], RULE_NG 대상)엔 이미 §4.1-A 등 앞 단계에서 데이터 부족 케이스가 걸러진 뒤라 별도 게이트가 필요 없음). 다만 극단적으로 `mode_count`/`dominant_period`가 그래도 `None`으로 나오는 경우(예: 표본이 아주 작은데도 여기까지 올라온 예외적 케이스)에 대한 방어책으로, 그런 필드가 필요한 분기(4단계 c/d/e)에서 값이 `None`이면 크래시 대신 `PENDING`으로 안전하게 빠진다(rationale에 "다봉성 계산 불가" 등으로 기록).
+- **`ShapeVerdict`**: `shape_category`(str, 9종 중 하나 — `None` 없음), `candidate_shape_category`(str|None, `shape_category=PENDING`일 때만 값이 참 — 2단계/4단계 gap-zone/5단계 보류 케이스에서 "보류 전 후보"를 기록), `rationale`(사람이 읽을 한국어 문장 — 어떤 단계/조건이 결정했는지).
+- **`ShapeClassifierThresholds`** (전부 §3처럼 잠정값, 실측 후 재조정 필요):
+
+  | 필드 | 값 | 용도 |
+  |---|---|---|
+  | `fixed_near_fixed_mode_ratio` | 0.95 | 3단계 하드 게이트(마진 없음) — 실측 근거: 진짜 `FIXED_NEAR_FIXED`는 항상 `mode_ratio>=0.944`, 오염 가능한 연속형은 물리적으로 0.95를 못 넘음(사용자 확인). 6개 카테고리 분기(4단계)엔 안 쓰이는 이 게이트 전용 값이라 마진 대상이 아니다. |
+  | `trend_r2_min` | 0.75 | 4단계 a) TREND |
+  | `periodic_spectral_concentration_min` | 0.5 | 4단계 b) PERIODIC |
+  | `periodic_trend_r2_max` | 0.3 | 4단계 b) PERIODIC(TREND와 배타) |
+  | `discrete_unique_count_range` | (2, 6) | 4단계 c) DISCRETE — 정수 경계라 마진 대상 제외(실질 판별선은 `unique_ratio`) |
+  | `discrete_unique_ratio_max` | 0.3 | 4단계 c) DISCRETE |
+  | `discrete_resolution_fill_ratio_max` | 0.7 | 4단계 c) DISCRETE — §7.2 6번(잠정 feature) 기반 |
+  | `discrete_gap_consistency_max` | 0.7 | 4단계 c) DISCRETE — 위와 동일 |
+  | `multi_level_unique_ratio_min` | 0.3 | 4단계 d) MULTI_LEVEL — discrete 상한과 같은 경계점 |
+  | `skewed_abs_skewness_min` | 1.0 | 4단계 e) SKEWED |
+  | `trend_r2_margin` | 0.05 | 5단계 경계 판단 |
+  | `spectral_concentration_margin` | 0.05 | 5단계 경계 판단 |
+  | `skewness_margin` | 0.15 | 5단계 경계 판단 |
+  | `unique_ratio_margin` | 0.05 | 5단계 경계 판단 — discrete 상한/multi_level 하한 공유 |
+  | `discrete_resolution_fill_ratio_margin` | 0.05 | 5단계 경계 판단 — 잠정 feature 축이라 마진 필요(사용자 확인) |
+  | `discrete_gap_consistency_margin` | 0.05 | 5단계 경계 판단 — 위와 동일 이유 |
+
+- **결정 순서** (반드시 이 순서대로, 앞 단계가 해당하면 뒤 단계는 보지 않는다):
+
+  1. **FIXED_CONSTANT 게이트**: `unique_count == 1` → `FIXED_CONSTANT`(마진 없는 하드 게이트 — "완전히 하나의 값"은 정의상 애매할 여지가 없음). 원안엔 이 카테고리로 가는 경로가 아예 없어(1단계가 `mode_ratio>=0.95`만 체크) 완전 고정값도 `FIXED_NEAR_FIXED`로만 잡히는 gap이 있었는데, 이 단계로 해소했다.
+  2. **change_point 게이트**: `has_change_point` → `PENDING`, `candidate_shape_category=CHANGE_POINT` — "레짐 자체가 바뀌어서" 걸리는 것이라 형태가 뚜렷해 보여도 자동 확정하지 않는다. 원안은 이 게이트를 "형태 판단보다 우선"이라 설명하면서도 실제 순서는 `FIXED_NEAR_FIXED` 다음에 둬서 모순이었는데(예: `mode_ratio>=0.95`면 change_point가 있어도 그냥 확정돼버림), 이 순서(1단계 다음, 3단계보다 먼저)로 그 모순을 해소했다. `has_change_point`/`change_point_index`는 §7.2의 `change_point_features`(→ `segmenter.detect_change_point`)를 그대로 재사용한다.
+  3. **FIXED_NEAR_FIXED 게이트**: `mode_ratio >= 0.95` → `FIXED_NEAR_FIXED`(마진 없는 하드 게이트, 위 표 참고).
+  4. **6개 카테고리 후보 판별** (먼저 매칭되는 것 하나만 채택):
+     - a) `trend_r2 >= trend_r2_min` → TREND
+     - b) (a 아니고) `spectral_concentration >= periodic_spectral_concentration_min AND trend_r2 < periodic_trend_r2_max` → PERIODIC
+     - c) (a·b 아니고) `mode_count >= 2 AND discrete_unique_count_range[0] <= unique_count <= discrete_unique_count_range[1] AND unique_ratio < discrete_unique_ratio_max AND resolution_fill_ratio < discrete_resolution_fill_ratio_max AND gap_consistency < discrete_gap_consistency_max` → DISCRETE
+     - d) (a~c 아니고) `mode_count >= 2 AND unique_ratio >= multi_level_unique_ratio_min` → MULTI_LEVEL
+     - e) (a~d 아니고) `abs(skewness) >= skewed_abs_skewness_min AND mode_count <= 1` → SKEWED
+     - f) 위 전부 아니면 → SYMMETRIC_UNIMODAL(기본값)
+     - **gap-zone 처리(원안엔 없던 보강)**: `mode_count >= 2`인데 c)와 d) 둘 다 불일치하면(예: `unique_count`가 6을 넘거나 `unique_ratio`가 두 임계값 사이 애매한 구간) e)/f)로 넘기지 않고 곧바로 `PENDING`(다봉성 신호를 조용히 버리지 않기 위함).
+  5. **확정 여부 판단** (1·3단계 하드 게이트는 이 단계를 건너뛴다):
+     - **(a) 경계 근처 판단**: 4단계에서 후보를 결정한 값이 해당 `*_margin` 이내로 자기 임계값에 붙어 있으면 → `PENDING`(예: `trend_r2=0.73`은 `trend_r2_min=0.75`의 `trend_r2_margin=0.05` 이내라 경계). 원안의 "±10%"는 실제 예시들과 안 맞는 모호한 기준이었는데, feature별 절대 마진으로 명시해 계산 가능하게 했다.
+     - **(b) 상충 신호 판단**: 4단계 a)~e)의 원시 조건을 순서 무관하게 전부 재평가해서 **2개 이상 True**면 → `PENDING`(원안의 "서로 다른 카테고리를 가리키는 신호가 동시에 존재하는가"를 그대로 계산 가능한 형태로 번역).
+  - **절대 하지 않는 것**: 신호가 약하거나 상충하면 "그럴듯해 보여서" 확정하지 않는다 — 목표는 자동분류율을 높이는 게 아니라 확실한 것만 확정하고 애매한 건 사람에게 넘기는 것이다(원안 그대로 유지).
+- **`shape_category` 대상**: 이 분류기는 `Rule 최종 판정`의 `final_class`에 전혀 관여하지 않는다 — §7.1 ML 학습을 위한 부가 정보로만 쓰인다.
+- **파이프라인 연결**: `pipeline.py`의 `_compute_group`이 `compute_ml_features()` 직후 `classify_shape(ml_features, shape_thresholds)`를 호출해 `GroupComputation.shape_verdict` / `DatasetARow.shape_verdict`(다른 세션 한정 필드와 같은 자리)에 담는다.
+- **저장**: 별도 테이블 **`tb_tsum_shape_classification`**(PK `(eval_date, unique_key_id)`, 컬럼: `shape_category`/`candidate_shape_category`/`rationale`/`created_at` — `status` 컬럼은 없음) — `tb_tsum_ml_features`와도 분리한 이유는, 이 분류기 자체가 지금도 여러 차례 수정되고 있듯 로직/스키마가 앞으로도 자주 바뀔 가능성이 높아서다. Tab2 [저장] 시 `tb_anomaly_detection_raw`/`tb_tsum_ml_features`/`tb_tsum_shape_classification` 세 테이블을 전부 `commit=False`로 호출한 뒤 커넥션에서 커밋 1번(원자적).
+- **§4.2 세그멘테이션과의 관계**: change point 탐지가 세그먼트 분할의 핵심 판단 기준이 되는 방향으로 §4.2-1의 탐지 알고리즘 자체가 `ruptures` 기반으로 개정됐다(완만한 drift를 못 잡던 구 방식의 한계를 해소). `shape_classifier.py`의 2단계 게이트는 이 개정된 `detect_change_point`를 그대로 재사용한다. 세그먼트 개수(최대 2개, worst/other)는 그대로 유지했다(사용자 확인) — "change point 여부를 다른 분석보다 먼저 판단"하는 구조로의 명시적 파이프라인 재정리는 별도 과제로 남아있다.
+
+### 7.4 설계 개요 (모델 학습, 착수 전)
 
 - **알고리즘**: LightGBM/XGBoost 등.
 - **학습 데이터 분할은 반드시 시간 기준(time-based split)으로 한다.** 랜덤 k-fold는 미래 데이터가 과거 예측에 leak되므로 사용하지 않는다.
 - **클래스 불균형 대응**: 진성-조치필요 사례는 절대적으로 희소할 것으로 예상되므로 class weight 조정 또는 threshold 튜닝을 명시적으로 적용하고, 단순 accuracy가 아닌 precision/recall(특히 조치필요 class의 recall)을 주요 지표로 삼는다.
 - **SHAP**: 판정 근거를 리포트에 표기.
 - 결과 스키마(§2.3)의 `stage=ML_CLASSIFIED`, `confidence`(모델 예측 확률)는 이때 비로소 채워지기 시작한다.
+- §7.2/§7.3에서 미리 쌓은 feature/shape 분류 결과(`tb_tsum_ml_features`/`tb_tsum_shape_classification`)를 학습 입력으로 재사용한다.
 
-### 7.3 이 장에서 해결하지 않은 것
+### 7.5 이 장에서 해결하지 않은 것
 
 - 착수 여부/시점 자체가 미정 — Phase 1 baseline과 `PENDING_REVIEW` 검토 부담(§6)을 먼저 보고 판단한다.
 - 구체적 지표 목표치는 Phase 1 baseline 측정 이후에만 의미가 있으므로 지금 확정하지 않는다.
